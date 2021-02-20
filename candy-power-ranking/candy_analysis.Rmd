@@ -1,0 +1,197 @@
+---
+title: "Candy Power Ranking"
+author: "Thomas Alcock"
+date: "19 2 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(plotly)
+library(tibble)
+library(tidyr)
+library(gridExtra)
+```
+
+## EDA
+
+```{r prev}
+candy_df <- read.csv(
+  file = "candy-data.csv",
+  header = TRUE
+) %>% as_tibble()
+
+candy_df %>% 
+  arrange(desc(winpercent)) %>% 
+  slice(1:10)
+```
+
+```{r eda}
+# no significat 
+bi_plots <- ggpairs(candy_df %>% select_if(is.double))
+ggplotly(bi_plots)
+```
+
+```{r eda2}
+cdf_long <- pivot_longer(candy_df, cols = c(-competitorname, -sugarpercent, -winpercent, -pricepercent))
+
+sc_plots <- function(df, cond_var, p_size = 3, opacity = 4){
+  df <- df %>% 
+    filter(name == cond_var) %>% 
+    select(-name) %>% 
+    rename(!!sym(cond_var) := value) %>% 
+    mutate(!!sym(cond_var) := factor(!!sym(cond_var)))
+  
+  p1 <- ggplot(df, aes(x = pricepercent, y = winpercent, color = !!sym(cond_var))) +
+    geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() +  geom_smooth(method = "lm", se = FALSE)
+  
+  p2 <- ggplot(df, aes(x = sugarpercent, y = winpercent, color = !!sym(cond_var))) +
+    geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() + geom_smooth(method = "lm", se = FALSE)
+  
+  p3 <- grid.arrange(p1, p2)
+}
+
+```
+
+
+## Scatterplots {.tabset}
+
+Wie verhalten sich die Charakteristika zu Preis / Beliebtheit und Zucker / Beliebtheit?
+
+### Schokolade
+
+Produkte mit Schokolade fallen bspw. in höheren Preisbereich, sind aber auch beliebter als Produkte ohne. Schokoladenprodukte besitzen zudem höheren Zuckergehalt.
+
+```{r}
+sc_plots(cdf_long, "chocolate")
+```
+
+
+### Fruity
+
+
+```{r}
+sc_plots(cdf_long, "peanutyalmondy")
+```
+
+```{r lm}
+
+model_data <- candy_df %>% 
+ mutate(
+  across(
+    .cols = c(-competitorname, -pricepercent, -winpercent),
+    .fns = function(x) ifelse(x == 1, .$pricepercent, x)
+   )
+ )
+
+
+lin_model_int <- lm(
+  formula = winpercent ~ .,
+  data = model_data %>% select(-competitorname)
+)
+
+lin_model <- lm(
+  formula = winpercent ~ .,
+  data = model_data %>% select(-competitorname)
+)
+
+#summary(lin_model)
+```
+
+
+```{r}
+library(glmnet)
+library(tidymodels)
+library(parsnip)
+library(recipes)
+library(tune)
+library(rsample)
+library(tune)
+library(dials)
+library(vip)
+library(forcats)
+
+set.seed(1)
+
+model_df <- candy_df %>% 
+  mutate_if(is.integer, as.logical)
+
+boots <- bootstraps(model_df)
+
+lasso <- linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") 
+
+lasso_rec <- recipe(winpercent ~ ., data = model_df) %>% 
+  update_role(competitorname, new_role = "ID") %>% 
+  step_normalize(sugarpercent, pricepercent)
+
+wf <- workflow() %>% 
+  add_recipe(lasso_rec)
+  
+l_grid <- grid_regular(penalty(), levels = 500)
+
+res <- tune_grid(
+  wf %>% add_model(lasso), 
+  resamples = boots, 
+  grid = l_grid
+)
+  
+tune_plot <- res %>% 
+  collect_metrics() %>% 
+  filter(.metric == "rmse") %>% 
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_errorbar(
+    aes(ymin = mean - std_err,
+        ymax = mean + std_err)
+  ) +
+  geom_line(aes(y = mean)) +
+  theme_minimal() +
+  geom_vline(xintercept = min(mean), linetype = 2) +
+  scale_x_log10()
+
+
+best_model <- res %>% 
+  select_best("rmse")
+
+final_model <- finalize_workflow(
+  wf %>% add_model(lasso),
+  best_model
+)
+
+
+final_model %>% 
+  fit(data = model_df) %>% 
+  pull_workflow_fit() %>% 
+  vi(lambda = best_model$penalty) %>% 
+  mutate(Sign = if_else(Sign == "NEG", "Negativer Effekt", "Positiver Effekt")) %>% 
+  ggplot(aes(x = Importance, y = fct_reorder(Variable, Importance), fill = Sign)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() + labs(
+    x = "Relevanz", y = "Eigenschaft", fill = "",
+    title = "Relevanz von Eigenschaften für Beliebtheit"
+  )
+
+```
+
+```{r insample_preds}
+
+pred_model <- final_model %>% 
+  fit(data = model_df)
+
+pred_data <- pred_model %>% 
+  predict(model_df) %>% 
+  bind_cols(model_df)
+
+insample_preds <- pred_data %>% 
+  ggplot(aes(x = winpercent, y = .pred)) +
+  geom_point(size = 3, alpha = 0.5) + theme_minimal() +
+  labs(x="Beobachtet", y="Predicted")
+
+
+
+```
+
