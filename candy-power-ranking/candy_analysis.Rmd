@@ -120,7 +120,7 @@ set.seed(1)
 model_df <- candy_df %>% 
   mutate_if(is.integer, as.logical)
 
-boots <- bootstraps(model_df)
+folds <- vfold_cv(model_df, v = 20)
 
 lasso <- linear_reg(penalty = tune(), mixture = 1) %>% 
   set_engine("glmnet") 
@@ -132,30 +132,33 @@ lasso_rec <- recipe(winpercent ~ ., data = model_df) %>%
 wf <- workflow() %>% 
   add_recipe(lasso_rec)
   
-l_grid <- grid_regular(penalty(), levels = 500)
+l_grid <- grid_regular(penalty(), levels = 50)
 
 res <- tune_grid(
   wf %>% add_model(lasso), 
-  resamples = boots, 
+  resamples = folds, 
   grid = l_grid
 )
   
-tune_plot <- res %>% 
-  collect_metrics() %>% 
-  filter(.metric == "rmse") %>% 
+tune_df <- res %>% 
+  collect_metrics()
+
+tune_plot <- tune_df %>% 
+  filter(.metric == "rsq")
   ggplot(aes(x = penalty, y = mean, color = .metric)) +
   geom_errorbar(
     aes(ymin = mean - std_err,
-        ymax = mean + std_err)
+        ymax = mean + std_err),
+    alpha = 0.5
   ) +
   geom_line(aes(y = mean)) +
   theme_minimal() +
-  geom_vline(xintercept = min(mean), linetype = 2) +
   scale_x_log10()
 
+tune_plot
 
 best_model <- res %>% 
-  select_best("rmse")
+  select_best("rsq")
 
 final_model <- finalize_workflow(
   wf %>% add_model(lasso),
