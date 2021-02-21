@@ -256,11 +256,25 @@ xgbsim <- sim_xbg(
   model = rev_xgb
 )
 
+best_pred <- xgbsim[which.max(xgbsim$.pred),]
+
+model_df %>% 
+  filter(chocolate, !fruity, peanutyalmondy) %>% 
+  filter(abs(pricepercent - best_pred$pricepercent) < sim_threshold) %>% 
+  pull(competitorname)
+
 xgbsim %>%
-  filter(sugarpercent == unique(sugarpercent)[3]) %>% 
+  filter(abs(sugarpercent - 0.701) < 0.00001) %>% 
   filter(!fruity, peanutyalmondy) %>% 
   ggplot(aes(x = pricepercent, y = .pred, color = chocolate)) + 
   geom_line() + theme_minimal() + labs(y = "Predicted Winpercent", x = "Pricepercent")
+
+# method: 
+# 1. find good fitting model
+# 2. simulate all possible scenarios
+# 3. get scenario with maximum winpercent
+# 4. find candy closest to that scenario for recommendation
+# TODO implement for linear model
 
 # Best Subset selection --------------------------------------------------
 
@@ -357,12 +371,7 @@ grid.arrange(vimp_lasso, vimp_ranger, vi_xbg, nrow = 2)
 
 # Test model for sensibilty -----------------------------------------------
 
-preddf <- get_preds(model_df, lin_model)
-
-preddf %>% 
-  filter(chocolate & peanutyalmondy & !hard) %>% 
-  select(competitorname, winpercent, .pred) %>% 
-  arrange(desc(winpercent))
+preddf <- get_preds(candy_df, lin_model)
 
 simulate_win <- function(choc, pean, fruit, hard, sugarp){
   
@@ -380,5 +389,14 @@ simulate_win <- function(choc, pean, fruit, hard, sugarp){
 }
 
 
+
+# Pick most suitable candy ------------------------------------------------
+
+# 1. step, candy must have most important attr: choc, peanut, sugarpercent
+
+preddf %>% 
+  filter(chocolate & peanutyalmondy & !hard) %>%
+  filter(pricepercent <= quantile(pricepercent, probs = 0.25)) %>% 
+  filter(bar & crispedricewafer) %>% pull(competitorname)
 
 
