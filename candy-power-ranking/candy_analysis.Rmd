@@ -62,6 +62,8 @@ sc_plots <- function(df, cond_var, p_size = 3, opacity = 4){
 
 Wie verhalten sich die Charakteristika zu Preis / Beliebtheit und Zucker / Beliebtheit?
 
+# TODO make plots for chocolate, peanutyalmondy, fruity, hard, 
+
 ### Schokolade
 
 Produkte mit Schokolade fallen bspw. in höheren Preisbereich, sind aber auch beliebter als Produkte ohne. Schokoladenprodukte besitzen zudem höheren Zuckergehalt.
