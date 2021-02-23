@@ -15,6 +15,9 @@ library(plotly)
 library(tibble)
 library(tidyr)
 library(gridExtra)
+library(knitr)
+library(forcats)
+library(purrr)
 ```
 
 ## EDA
@@ -27,7 +30,9 @@ candy_df <- read.csv(
 
 candy_df %>% 
   arrange(desc(winpercent)) %>% 
-  slice(1:10)
+  slice(1:10) %>% 
+  select(competitorname, winpercent) %>% 
+  knitr::kable()
 ```
 
 ```{r eda}
@@ -43,69 +48,58 @@ sc_plots <- function(df, cond_var, p_size = 3, opacity = 4){
   df <- df %>% 
     filter(name == cond_var) %>% 
     select(-name) %>% 
+    mutate(value = ifelse(value==1, "Ja", "Nein")) %>% 
     rename(!!sym(cond_var) := value) %>% 
     mutate(!!sym(cond_var) := factor(!!sym(cond_var)))
   
   p1 <- ggplot(df, aes(x = pricepercent, y = winpercent, color = !!sym(cond_var))) +
-    geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() +  geom_smooth(method = "lm", se = FALSE)
+    geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() + 
+    geom_smooth(method = "lm", se = FALSE, size=0.5)
   
   p2 <- ggplot(df, aes(x = sugarpercent, y = winpercent, color = !!sym(cond_var))) +
-    geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() + geom_smooth(method = "lm", se = FALSE)
+    geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() +
+    geom_smooth(method = "lm", se = FALSE, size=0.5)
   
   p3 <- grid.arrange(p1, p2)
 }
-
 ```
 
 
-## Scatterplots {.tabset}
+## Boxplots
 
-Wie verhalten sich die Charakteristika zu Preis / Beliebtheit und Zucker / Beliebtheit?
+```{r}
+cdf_long %>% 
+  mutate(value = fct_reorder(paste0(value), winpercent),
+         value = ifelse(value == 1, "Ja", "Nein")) %>% 
+  ggplot(aes(x = value, y = winpercent, color = name)) + 
+  geom_boxplot() +
+  facet_wrap(.~name, ncol = 5) +
+  theme_minimal() +
+  labs(x = "Besitzt Eigenschaft", y = "Beliebtheit",  color = "")
+```
 
-# TODO make plots for chocolate, peanutyalmondy, fruity, hard, 
-
-### Schokolade
-
-Produkte mit Schokolade fallen bspw. in höheren Preisbereich, sind aber auch beliebter als Produkte ohne. Schokoladenprodukte besitzen zudem höheren Zuckergehalt.
+Für ausgewählte Variablen mit großen Unterschieden werden Scatterplots erstellt.
 
 ```{r}
 sc_plots(cdf_long, "chocolate")
-```
-
-
-### Fruity
-
-
-```{r}
+sc_plots(cdf_long, "crispedricewafer")
 sc_plots(cdf_long, "peanutyalmondy")
 ```
 
-```{r lm}
-
-model_data <- candy_df %>% 
- mutate(
-  across(
-    .cols = c(-competitorname, -pricepercent, -winpercent),
-    .fns = function(x) ifelse(x == 1, .$pricepercent, x)
-   )
- )
-
-
-lin_model_int <- lm(
-  formula = winpercent ~ .,
-  data = model_data %>% select(-competitorname)
-)
-
-lin_model <- lm(
-  formula = winpercent ~ .,
-  data = model_data %>% select(-competitorname)
-)
-
-#summary(lin_model)
-```
-
+Für einige Features nur relativ geringe Anzahl an Ja Einträgen. deshalb Bootstrap Sampling mit Stratifizierung nach peanutyalmondy, weil diese Eigenschaft hohen Anteil an 
 
 ```{r}
+candy_df %>% 
+  select_if(is.integer) %>% 
+  purrr::map_dfr(mean) %>% 
+  pivot_longer(cols = everything()) %>% 
+  arrange(value) %>%
+  ggplot(aes(x = value, y = fct_reorder(name, value))) +
+  geom_bar(stat = "identity") + theme_minimal() +
+  labs(x = "Relativer Anteil", y = "Eigenschaft")
+```
+
+```{r lm}
 library(glmnet)
 library(tidymodels)
 library(parsnip)
@@ -116,6 +110,50 @@ library(tune)
 library(dials)
 library(vip)
 library(forcats)
+
+boots <- bootstraps(candy_df, times = 1000, strata = "peanutyalmondy")
+
+run_boot_model <- function(boot_split){
+  
+  df <- boot_split %>% analysis()
+  simple_lm <- lm(winpercent ~ ., data = df %>% select(-competitorname))
+  raw_summary <- simple_lm %>% summary()
+  tidy_summary <- tidy(raw_summary)
+  tidy_summary$adj_r_sq <- raw_summary$adj.r.squared
+  tidy_summary$id <- boot_split$id$id
+  tidy_summary
+}
+
+bs_res <- map_dfr(boots$splits, run_boot_model)
+
+```
+
+```{r}
+plot_data <- bs_res %>% 
+  filter(term != "(Intercept)")
+  
+bounds <- plot_data %>% 
+  group_by(term) %>% 
+  summarise(
+    upper_bound = quantile(estimate, probs = 0.975),
+    lower_bound = quantile(estimate, probs = 0.025)
+  )
+
+bs_plot <- plot_data %>% 
+  select(term, estimate) %>% 
+  pivot_longer(cols = estimate) %>% 
+  ggplot(aes(x = value, fill = term, color = term)) + 
+  geom_density(alpha = 0.7) + 
+  facet_wrap(. ~ term, nrow = 4) +
+  theme_minimal() + theme(legend.position = "none") +
+  labs(x = "Regressionskoeffizient", y = "Dichte", title = "Koeffizienten nach Bootstrap Sampling") +
+  geom_vline(data = bounds, mapping = aes(xintercept = upper_bound, color = term), linetype = 2) +
+  geom_vline(data = bounds, mapping = aes(xintercept = lower_bound, color = term), linetype = 2) +
+  geom_vline(xintercept = 0, linetype = 2, alpha = 0.5)
+```
+
+```{r}
+
 
 set.seed(1)
 
