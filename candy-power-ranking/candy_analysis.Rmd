@@ -18,9 +18,22 @@ library(gridExtra)
 library(knitr)
 library(forcats)
 library(purrr)
+
+library(glmnet)
+library(tidymodels)
+library(parsnip)
+library(recipes)
+library(tune)
+library(rsample)
+library(tune)
+library(dials)
+library(vip)
+library(forcats)
+library(gt)
+
 ```
 
-## EDA
+# EDA
 
 ```{r prev}
 candy_df <- read.csv(
@@ -28,17 +41,20 @@ candy_df <- read.csv(
   header = TRUE
 ) %>% as_tibble()
 
-candy_df %>% 
-  arrange(desc(winpercent)) %>% 
-  slice(1:10) %>% 
-  select(competitorname, winpercent) %>% 
-  knitr::kable()
-```
+tab_plot <- candy_df %>%
+  rename(Produkt = competitorname,
+         Beliebtheit = winpercent,
+         Preisperzentil = pricepercent) %>% 
+  mutate(Produkt = gsub("Õ","'",Produkt),
+         Preisperzentil = round(100*Preisperzentil, 2),
+         Beliebtheit = round(Beliebtheit, 2)) %>% 
+  select(Produkt, Beliebtheit, Preisperzentil) %>% 
+  arrange(desc(Beliebtheit)) %>%
+  slice(1:10) %>%
+  gt() %>% 
+  tab_header("Top 10 Produkte nach Beliebtheit")
 
-```{r eda}
-# no significat 
-bi_plots <- ggpairs(candy_df %>% select_if(is.double))
-ggplotly(bi_plots)
+
 ```
 
 ```{r eda2}
@@ -54,21 +70,22 @@ sc_plots <- function(df, cond_var, p_size = 3, opacity = 4){
   
   p1 <- ggplot(df, aes(x = pricepercent, y = winpercent, color = !!sym(cond_var))) +
     geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() + 
-    geom_smooth(method = "lm", se = FALSE, size=0.5)
+    #geom_smooth(method = "lm", se = FALSE, size=0.5) +
+    labs(x = "Preisperzentil", y = "Beliebtheit")
   
   p2 <- ggplot(df, aes(x = sugarpercent, y = winpercent, color = !!sym(cond_var))) +
     geom_point(size = p_size, alpha = 1/opacity) + theme_minimal() +
-    geom_smooth(method = "lm", se = FALSE, size=0.5)
+    #geom_smooth(method = "lm", se = FALSE, size=0.5) +
+    labs(x = "Zuckergehalt", y = "Beliebtheit")
   
-  p3 <- grid.arrange(p1, p2)
+  grid.arrange(p1, p2)
 }
 ```
 
-
-## Boxplots
+## Boxplot
 
 ```{r}
-cdf_long %>% 
+bp <- cdf_long %>% 
   mutate(value = fct_reorder(paste0(value), winpercent),
          value = ifelse(value == 1, "Ja", "Nein")) %>% 
   ggplot(aes(x = value, y = winpercent, color = name)) + 
@@ -78,44 +95,90 @@ cdf_long %>%
   labs(x = "Besitzt Eigenschaft", y = "Beliebtheit",  color = "")
 ```
 
-Für ausgewählte Variablen mit großen Unterschieden werden Scatterplots erstellt.
-
 ```{r}
-sc_plots(cdf_long, "chocolate")
-sc_plots(cdf_long, "crispedricewafer")
-sc_plots(cdf_long, "peanutyalmondy")
+bp2 <- cdf_long %>% 
+  filter(name %in% c("chocolate", "crispedricewafer", "peanutyalmondy", "fruity")) %>% 
+  mutate(value = fct_reorder(paste0(value), winpercent),
+         value = ifelse(value == 1, "Ja", "Nein")) %>% 
+  ggplot(aes(x = value, y = winpercent, color = name)) + 
+  geom_boxplot() +
+  facet_wrap(.~name, ncol = 5) +
+  theme_minimal() +
+  labs(x = "Besitzt Eigenschaft", y = "Beliebtheit",  color = "")
+
+bp2
 ```
 
-Für einige Features nur relativ geringe Anzahl an Ja Einträgen. deshalb Bootstrap Sampling mit Stratifizierung nach peanutyalmondy, weil diese Eigenschaft hohen Anteil an 
+For candies that have chocolate, rice wafers, taste fruity or are peanutyalymondy there seems to be a larger difference in winpercent.
+
+## Scatterplots
+
+Scatterplots for selected variables with large differences in terms of winpercent. Chocolate candies tend to be more expensive and more sugary.
 
 ```{r}
 candy_df %>% 
+  mutate_if(is.integer, function(x) ifelse(x==1, "Ja", "Nein")) %>% 
+  pivot_longer(cols = -c(competitorname, winpercent, pricepercent, sugarpercent)) %>% 
+  ggplot(aes(x = pricepercent, y = winpercent, color = value, group= name)) +
+  geom_point() +
+  facet_wrap(name ~ .)
+```
+
+```{r}
+sc1 <- sc_plots(cdf_long, "chocolate")
+```
+
+Only few rice wafer candies are available at all, which is why we need to resample the data for estimation. Within rice wafer candies there seems to be no clear effect of price or sugar
+
+```{r}
+sc2 <- sc_plots(cdf_long, "crispedricewafer")
+```
+
+With respect to sugar and price there also seems to be no clear effect on the popularity of peanutyalmondy candies.
+
+```{r}
+sc3 <- sc_plots(cdf_long, "peanutyalmondy")
+```
+
+Fruity candies tend to be less expensive and also less popular.
+
+```{r}
+sc4 <- sc_plots(cdf_long, "fruity")
+```
+
+Gibt es Eigenschaften, die eine Imbalance aufweisen? Wichtig für Re-sampling der Daten.
+
+```{r}
+percent_yes <- candy_df %>% 
   select_if(is.integer) %>% 
-  purrr::map_dfr(mean) %>% 
+  purrr::map_dfr(~ 100 * mean(.)) %>% 
   pivot_longer(cols = everything()) %>% 
   arrange(value) %>%
   ggplot(aes(x = value, y = fct_reorder(name, value))) +
-  geom_bar(stat = "identity") + theme_minimal() +
+  geom_bar(stat = "identity", alpha = 0.7, fill = "blue") + theme_minimal() +
   labs(x = "Relativer Anteil", y = "Eigenschaft")
+
+percent_yes
 ```
 
-```{r lm}
-library(glmnet)
-library(tidymodels)
-library(parsnip)
-library(recipes)
-library(tune)
-library(rsample)
-library(tune)
-library(dials)
-library(vip)
-library(forcats)
+# Modeling
 
-boots <- bootstraps(candy_df, times = 1000, strata = "peanutyalmondy")
+## Bootstrap Estimation
+
+Small sample size makes inference difficult and standard errors may be unreliable. Therefore we use a non-parametric bootstrap procedure to gauge the variation in the sampling distribution of the model coefficients.
+
+```{r lm}
+candy_df <- candy_df %>% 
+  mutate(strat_var = paste0(
+    hard, peanutyalmondy, caramel, 
+    nougat, crispedricewafer
+  ))
+
+boots <- bootstraps(candy_df, times = 1000, strata = strat_var)
 
 run_boot_model <- function(boot_split){
-  
-  df <- boot_split %>% analysis()
+  df <- boot_split %>% analysis() %>% 
+    select(-strat_var)
   simple_lm <- lm(winpercent ~ ., data = df %>% select(-competitorname))
   raw_summary <- simple_lm %>% summary()
   tidy_summary <- tidy(raw_summary)
@@ -125,7 +188,6 @@ run_boot_model <- function(boot_split){
 }
 
 bs_res <- map_dfr(boots$splits, run_boot_model)
-
 ```
 
 ```{r}
@@ -153,88 +215,239 @@ bs_plot <- plot_data %>%
 ```
 
 ```{r}
+bs_plot
+```
 
+```{r}
+# TODO price coef lines?
 
-set.seed(1)
+bs_res %>% 
+  filter(term %in% c("pricepercent", "(Intercept)"))
+```
+
+## Full model estimation
+
+Estimate baseline model to compare against other models in robustness checks
+
+```{r}
+# basic model without bs
+full_model <- lm(winpercent ~ ., 
+                 data = candy_df %>% select(-competitorname, -strat_var))
+
+full_model_res <- full_model %>% 
+  summary() %>% tidy()
 
 model_df <- candy_df %>% 
-  mutate_if(is.integer, as.logical)
+  mutate(cd = cooks.distance(full_model))
 
-folds <- vfold_cv(model_df, v = 20)
+model_df <- model_df %>% 
+  predict(full_model, .) %>% 
+  as_tibble() %>% 
+  rename(preds_baseline = value) %>% 
+  bind_cols(model_df)
 
-lasso <- linear_reg(penalty = tune(), mixture = 1) %>% 
-  set_engine("glmnet") 
-
-lasso_rec <- recipe(winpercent ~ ., data = model_df) %>% 
-  update_role(competitorname, new_role = "ID") %>% 
-  step_normalize(sugarpercent, pricepercent)
-
-wf <- workflow() %>% 
-  add_recipe(lasso_rec)
-  
-l_grid <- grid_regular(penalty(), levels = 50)
-
-res <- tune_grid(
-  wf %>% add_model(lasso), 
-  resamples = folds, 
-  grid = l_grid
-)
-  
-tune_df <- res %>% 
-  collect_metrics()
-
-tune_plot <- tune_df %>% 
-  filter(.metric == "rsq")
-  ggplot(aes(x = penalty, y = mean, color = .metric)) +
-  geom_errorbar(
-    aes(ymin = mean - std_err,
-        ymax = mean + std_err),
-    alpha = 0.5
-  ) +
-  geom_line(aes(y = mean)) +
+outlier_plot <- model_df %>% 
+  ggplot(aes(x = cd)) + 
+  geom_histogram(bins = 20, fill = "blue", alpha = 0.7) +
   theme_minimal() +
-  scale_x_log10()
+  labs(x = "Cook's Distanz", y = "Frequenz")
+  
+het_df <- model_df %>% 
+  mutate(resid = winpercent - preds_baseline) %>% 
+  ggplot(aes(x = preds_baseline, y = resid)) +
+  geom_point(alpha = 0.7, size = 3) + theme_minimal() +
+  labs(x = "Predicted", y = "Residual")
+  
+pred_plot <- model_df %>% 
+  ggplot(aes(x = preds_baseline, y = winpercent)) +
+  geom_point(size = 3, alpha = 0.5) +
+  theme_minimal() +
+  geom_smooth(se = FALSE, method = "lm") +
+  labs(x = "Predicted", y = "Beobachtet", 
+       title = paste0(
+         "Adj. R-Squared:", 
+          round(glance(full_model)$adj.r.squared, 2))
+       )
 
-tune_plot
+```
 
-best_model <- res %>% 
-  select_best("rsq")
+## Model Summary
 
-final_model <- finalize_workflow(
-  wf %>% add_model(lasso),
-  best_model
+```{r}
+coef_df <-  full_model_res %>% 
+  mutate(lower = estimate - 2*std.error,
+         upper = estimate + 2*std.error,
+         term  = ifelse(term=="(Intercept)", "intercept", term))
+
+coefplot <- coef_df %>%
+  filter(term != "intercept") %>% 
+  ggplot(aes(x = estimate, y = fct_reorder(term, abs(statistic)
+  ))) + 
+  geom_point(size = 4, alpha = 0.5) +
+  geom_errorbar(aes(xmin = lower, xmax = upper)) +
+  geom_vline(aes(xintercept = 0), linetype = 2) + 
+  theme_minimal() +
+  labs(x = "Effekt", y = "Attribut")
+```
+
+## Robustness checks
+
+Do effects remain when variable composition changes slightly?
+
+```{r}
+rdf <- candy_df %>% select(-competitorname, -strat_var)
+
+model_combs <- crossing(
+  "caramel" = 0:1,
+  "crispedricewafer" = 0:1,
+  "nougat" = 0:1,
+  "pluribus" = 0:1,
+  "hard" = 0:1,
+  "bar" = 0:1,
+  "sugarpercent" = 0:1,
+  "pricepercent" = 0:1,
+  "peanutyalmondy" = 0:1,
+  "fruity" = 0:1,
+  "chocolate" = 0:1
 )
 
+# exclude degenerate cases, i.e. all 1 or all 0
+model_combs <- model_combs[-c(1, nrow(model_combs)),]
 
-final_model %>% 
-  fit(data = model_df) %>% 
-  pull_workflow_fit() %>% 
-  vi(lambda = best_model$penalty) %>% 
-  mutate(Sign = if_else(Sign == "NEG", "Negativer Effekt", "Positiver Effekt")) %>% 
-  ggplot(aes(x = Importance, y = fct_reorder(Variable, Importance), fill = Sign)) +
-  geom_bar(stat = "identity") +
-  theme_minimal() + labs(
-    x = "Relevanz", y = "Eigenschaft", fill = "",
-    title = "Relevanz von Eigenschaften für Beliebtheit"
+drop_vars <- function(idx){
+  model_combs[idx,] %>% 
+  pivot_longer(cols = everything()) %>% 
+  filter(value == 1) %>% 
+  pull(name)
+}
+
+rb_lm <- function(x){
+  drop_these <- drop_vars(x)
+  df <- rdf %>% select(-all_of(drop_these))
+  res <- tidy(summary(lm(winpercent ~ ., data = df)))
+  res$missing_vars <- paste0(drop_these, collapse = "_")
+  res
+}
+
+robust_models <- map_dfr(1:nrow(model_combs), rb_lm)
+```
+
+Distributions of coefficients taking out combinations of variables and then estimating a model without them.
+
+```{r}
+rob_plot <- robust_models %>%
+  filter(term != "(Intercept)") %>% 
+  ggplot(aes(x = estimate, y = ..density.., fill = term)) + 
+  geom_density(aes(y = ..density.., color = term), alpha = 0.4) +
+  theme_minimal() +
+  labs(x = "Effekt", y = "Frequenz") +
+  facet_wrap(. ~ term, nrow = 5) +
+  geom_vline(aes(xintercept = 0), linetype = 2) +
+  theme(legend.position = "none")
+```
+
+The effect for fruity flavor seems to vary a great deal across different model specifications, same is true for price, bar, rice wafers and nougat.
+
+**chocolate peanutyalmondy** and **sugarpercent** seem to have pretty robust effects in terms of sign, with chocolate displaying some more variation in terms of effect size.
+
+## Interaction Model
+
+Interaction terms have large standard errors, no conclusion can be drawn abt interaction terms fruit x price, fruit x sugar.
+
+```{r}
+int_df <- candy_df %>% select(-competitorname, -strat_var) 
+
+int_df <- int_df %>% mutate(
+  fruit_price = pricepercent * fruity,
+  fruit_sugar = sugarpercent * fruity,
+  choc_price = chocolate * pricepercent,
+  choch_sugar = chocolate * sugarpercent
+)
+
+int_model <- lm(winpercent ~ ., data = int_df)
+
+int_model_res <- int_model %>% 
+  summary() %>% 
+  tidy() %>% 
+  mutate(
+    upper = estimate + 2*std.error,
+    lower = estimate - 2*std.error
+  )
+
+broom::glance(int_model)
+```
+
+# Bootstrap vs Full model Coefs
+
+```{r}
+mean_df <- bs_res %>% 
+  group_by(term) %>% 
+  summarise(mean_estimate = mean(estimate)) %>% 
+  ungroup() %>% 
+  left_join(bounds) %>% 
+  left_join(coef_df) %>% 
+  filter(term != "(Intercept)")
+    
+
+bs_regular_comparison <- mean_df %>% 
+  ggplot(data = mean_df, mapping = aes(y = fct_reorder(term, estimate))) +
+  geom_point(mapping = aes(x = estimate, color = "Standard OLS"), size = 4, alpha = 0.4) +
+  geom_point(mapping = aes(x = mean_estimate, color = "Bootstrapping"), size = 4, alpha = 0.4) +
+  geom_errorbar(aes(xmin = lower_bound, xmax = upper_bound), color = "blue") + 
+  geom_errorbar(aes(xmin = lower, xmax = upper), color = "red") +
+  theme_minimal() + labs(x = "Effekt", y = "Attribut", color = "")  +
+  geom_vline(aes(xintercept = 0), linetype= 2) +
+  scale_x_continuous(breaks  = pretty_breaks(10)) +
+  scale_color_manual(
+    values = c("Standard OLS" = "red", "Bootstrapping" = "blue")
   )
 
 ```
 
-```{r insample_preds}
+# Recommendation
 
-pred_model <- final_model %>% 
-  fit(data = model_df)
-
-pred_data <- pred_model %>% 
-  predict(model_df) %>% 
-  bind_cols(model_df)
-
-insample_preds <- pred_data %>% 
-  ggplot(aes(x = winpercent, y = .pred)) +
-  geom_point(size = 3, alpha = 0.5) + theme_minimal() +
-  labs(x="Beobachtet", y="Predicted")
-
-
-
+```{r}
+model_df %>% 
+  filter(
+    chocolate == 1 & 
+    peanutyalmondy == 1 &
+    hard == 0
+  ) %>% 
+  arrange(desc(sugarpercent)) %>% 
+  slice(1) %>% 
+  t()
 ```
 
+```{r}
+sim_df <- crossing(
+  "caramel" = 0:1,
+  "crispedricewafer" = 0:1,
+  "nougat" = 0:1,
+  "pluribus" = 0:1,
+  "hard" = 0:1,
+  "bar" = 0:1,
+  "pricepercent" = seq(min(candy_df$pricepercent), max(candy_df$pricepercent), 0.01),
+  "sugarpercent" = seq(min(candy_df$sugarpercent), max(candy_df$sugarpercent), 0.01),
+  "peanutyalmondy" = 0:1,
+  "fruity" = 0:1,
+  "chocolate" = 0:1
+)
+
+sim_df$pred <- predict.lm(full_model, newdata = sim_df)
+
+
+sim_df %>% 
+  filter(pred == max(pred)) %>% 
+  pivot_longer(cols = everything()) %>% 
+  filter(name %in% c("chocolate", "peanutyalmondy", "sugarpercent", ""))
+  knitr::kable()
+```
+
+```{r}
+model_df %>% 
+  filter(chocolate == 1 &
+         peanutyalmondy == 1 &
+         hard == 0 &
+         nougat == 01) %>% 
+  arrange(pricepercent)
+```
